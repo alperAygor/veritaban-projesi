@@ -1,0 +1,154 @@
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
+from typing import Optional
+from datetime import datetime, timedelta
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from database import get_db_connection
+import os
+import psycopg
+from psycopg.rows import dict_row
+
+# Configuration
+SECRET_KEY = os.getenv("SECRET_KEY", "supersecretkey")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Password Hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# App Init
+app = FastAPI(title="ToolShare API")
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Models ---
+class UserRegister(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    role: str = "user" # 'admin' or 'user'
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user_id: int
+    name: str
+    role: str
+
+# --- Helpers ---
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# --- Dependencies ---
+def get_current_user_id(token: str):
+    # This is a simplified dependency. In a real app, use OAuth2PasswordBearer
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return int(user_id)
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Could not validate credentials")
+
+# --- Routes ---
+
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to ToolShare API"}
+
+@app.post("/api/auth/register", response_model=Token)
+def register(user: UserRegister):
+    if user.role not in ['admin', 'user']:
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        
+        # Check if email exists
+        cur.execute("SELECT id FROM users WHERE email = %s", (user.email,))
+        if cur.fetchone():
+            raise HTTPException(status_code=400, detail="Email already registered")
+        
+        # Create user
+        hashed_pw = get_password_hash(user.password)
+        cur.execute(
+            "INSERT INTO users (name, email, password, role) VALUES (%s, %s, %s, %s) RETURNING id, name, role",
+            (user.name, user.email, hashed_pw, user.role)
+        )
+        new_user = cur.fetchone()
+        conn.commit()
+        
+        # Generate Token
+        access_token = create_access_token(data={"sub": str(new_user['id']), "role": new_user['role']})
+        return {
+            "access_token": access_token, 
+            "token_type": "bearer",
+            "user_id": new_user['id'], 
+            "name": new_user['name'],
+            "role": new_user['role']
+        }
+        
+    except Exception as e:
+        conn.rollback()
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@app.post("/api/auth/login", response_model=Token)
+def login(user: UserLogin):
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, name, password, role FROM users WHERE email = %s", (user.email,))
+        db_user = cur.fetchone()
+        
+        if not db_user or not verify_password(user.password, db_user['password']):
+            raise HTTPException(status_code=401, detail="Incorrect email or password")
+            
+        access_token = create_access_token(data={"sub": str(db_user['id']), "role": db_user['role']})
+        return {
+            "access_token": access_token, 
+            "token_type": "bearer",
+            "user_id": db_user['id'], 
+            "name": db_user['name'],
+            "role": db_user['role']
+        }
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+# --- Health Check ---
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
